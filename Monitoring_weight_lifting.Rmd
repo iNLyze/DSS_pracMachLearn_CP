@@ -1,0 +1,347 @@
+---
+title: "Monitoring Your Weight Lifting Excercise"
+author: "iNLyze"
+date: "Saturday, July 18, 2015"
+output: html_document
+---
+
+This report was created as part of the module "Practical Machine Learning" of the Data Science Specialization on Coursera. The goal is to predict how well a test subject performed a weight lifting excercise using machine learning. The movement of the test subjects was recorded using wearable sensors. The underlying data was published by [Velloso et al. (2013)](http://groupware.les.inf.puc-rio.br/har). 
+
+
+
+# Loading libraries and data
+
+The original data was split into a [testing](https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv) and [training](https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv) set, downloaded and imported using *read.csv()*.
+Note: Data exploration revealed several kinds of missing data which were omitted (see also *na.strings()* argument).
+
+
+
+```{r includes, warning=FALSE}
+library(caret)
+library(dplyr)
+if (!require(randomForest))
+        install.packages("randomForest")
+
+```
+
+
+```{r setwd, echo=FALSE}
+my.workdir <- "..\\predMachLearn"
+setwd(my.workdir)
+```
+
+
+```{r load_and_preprocess}
+
+path.testing <- paste0(my.workdir, "\\pml-testing.csv")
+path.training <- paste0(my.workdir, "\\pml-training.csv")
+
+# Read the data
+training.raw <- read.csv(file = path.training, header = T, sep = ",", na.strings=c("NA","#DIV/0!",""))
+testing.raw <- read.csv(file = path.testing, header = T, sep = ",", na.strings=c("NA","#DIV/0!",""))
+
+
+
+```
+
+# Data splitting for cross-validation
+
+The downloaded testing set is saved for evaluating the model on 20 test cases. Hence, a second testing set, called *valset* is split off the training set for cross-validation. A third set, called *modelset* is split off as 10% of the remaining training set.  
+
+```{r validation_set}
+
+set.seed(34542134)
+inValSet <- createDataPartition(training.raw$classe, p=0.15, list = F )
+valset.raw <- training.raw[inValSet, ]
+training.raw <- training.raw[-inValSet, ]
+inModelSet <- createDataPartition(training.raw$classe, p=0.1, list = F)
+modelset.raw <- training.raw[inModelSet, ]
+training.raw <- training.raw[-inModelSet, ]
+
+```
+Cross-validation and out-of sample error are assessed using *valset*. The *modelset* is used for model selection. 
+
+# Preprocessing for dimensionality reduction 
+
+## Weeding out non-informative variables
+
+The original 160 variables are not all informative for model building, because they have near zero variance. Only those variables are kept which are non-zero in all four data sets, i.e. *training*, *testing*, *valset* and *modelset*. The columns for numbering, user names and timestamps are omitted as well. This leaves 56 numeric variables.
+
+```{r preProcess_nzv, cache=TRUE}
+# Dump near zero variables from training set
+nzvMetrics.training <- nearZeroVar(x = training.raw, saveMetrics = T)
+nzvIndex.training <- nearZeroVar(x = training.raw, saveMetrics = F)
+
+# Find nzv's from test set as well - no point in keeping variables I can't test for
+nzvMetrics.testing <- nearZeroVar(x = testing.raw, saveMetrics = T)
+nzvIndex.testing <- nearZeroVar(x = testing.raw, saveMetrics = F)
+
+nzvMetrics.valset <- nearZeroVar(x = valset.raw, saveMetrics = T)
+nzvIndex.valset <- nearZeroVar(x = valset.raw, saveMetrics = F)
+
+nzvMetrics.modelset <- nearZeroVar(x = modelset.raw, saveMetrics = T)
+nzvIndex.modelset <- nearZeroVar(x = modelset.raw, saveMetrics = F)
+
+#Dump all vars which are zero anywhere
+nonZero <- !nzvMetrics.training$zeroVar & !nzvMetrics.testing$zeroVar & !nzvMetrics.valset$zeroVar & !nzvMetrics.modelset$zeroVar
+
+# Get rid of numbering column, user names (col 2) and cvtd timestamps (col 5) - then all vars are numeric
+nonZero[1] <- FALSE
+nonZero[2] <- FALSE
+nonZero[5] <- FALSE
+
+# Create training, testing and valset for actual model building
+training <- tbl_df(training.raw[, nonZero])
+testing <- tbl_df(testing.raw[, nonZero])
+valset <- tbl_df(valset.raw[, nonZero])
+modelset <- tbl_df(modelset.raw[, nonZero])
+
+# Col index to classe
+classeIndex <- sum(nonZero)
+classe.train <- training.raw$classe
+classe.val <- valset.raw$classe
+classe.modelset <- modelset.raw$classe
+
+# Freeing RAM
+rm(training.raw)
+rm(valset.raw)
+
+```
+
+## Reducing dimensionality to principle components
+
+Since movements are carried out in three spatial dimensions one could expect variables to be correlated. The following chunk tests for this:
+
+```{r preProcess_pca_1}
+
+# Find strongly correlated variables
+M <- abs(cor(training[, -classeIndex]))
+diag(M) <- 0
+which(M > 0.8, arr.ind = T)
+
+```
+One observes lots of correlated variables. Thus, principle component analysis is carried out. At the same time data is BoxCox transformed, normalized and missing data is imputed using k-nearest-neighbours. All transformations are applied equally to the *training*, *testing* and *valset* equally. The classe variable is removed from them using *classeIndex* created above.
+
+```{r preProcess_pca_2}
+
+#PCA needs further transformations, all carried out by preProcess
+
+# BoxCox, Normalize and impute NAs, PCA
+normalized.training <- preProcess(x=as.data.frame(training[,-classeIndex]), method = c("BoxCox", "center", "scale", "knnImpute", "pca"))
+training <- predict(normalized.training, newdata=as.data.frame(training[, -classeIndex]))
+
+# Apply the same trafo's to test set, validation set and modelset
+testing <- predict(normalized.training, newdata=as.data.frame(testing[, -classeIndex]))
+
+valset <- predict(normalized.training, newdata=as.data.frame(valset[, -classeIndex]))
+
+modelset <- predict(normalized.training, newdata=as.data.frame(modelset[, -classeIndex]))
+
+```
+
+# Model building
+
+The objective is a 5-class classification problem. Four different machine learning approaches are selected: A Random Forest model, a Naive Bayesian learner, a Support Vector Machine and a QDA classifier. It turned out that these have vastly different computation and memory needs. The out of sample error for each is cross-validated against *valset* and put into perspective. 10-fold resampling settings are chosen, so the models can be compared by resample() lateron. 
+
+
+```{r random_forest, warning=FALSE, cache = FALSE}
+
+file.rf <- paste0(my.workdir, "\\model.rf.Rds")
+
+if (file.exists(file.rf)) {
+        model.rf <- readRDS(file.rf)
+} else {
+        mtryGrid <- expand.grid(mtry = 20)
+        ctrl <- trainControl(method = 'cv')
+        model.rf <- train(classe.modelset ~ ., 
+                          data = modelset, 
+                          method = "rf", 
+                          importance = TRUE, 
+                          ntree = 10, 
+                          tuneGrid = mtryGrid, 
+                          trControl = ctrl )
+        saveRDS(model.rf, file.rf)
+}
+
+prediction.rf <- predict(model.rf, valset)
+
+cM.rf <- confusionMatrix(prediction.rf, classe.val)
+
+```
+
+```{r Naive_Bayesian, warning=FALSE, cache=FALSE}
+
+file.nb <- paste0(my.workdir, "\\model.nb.Rds")
+
+if (file.exists(file.nb)) {
+        model.nb <- readRDS(file.nb)
+} else {
+        grid <- expand.grid(fL = 0, usekernel = TRUE)
+        ctrl <- trainControl(method = 'cv', 
+                             number = 10)
+        model.nb <- train(classe.modelset ~ .,
+                          data = modelset, 
+                          method="nb", 
+                          trControl = ctrl, 
+                          tuneGrid = grid) 
+        saveRDS(model.nb, file.nb)
+}
+
+prediction.nb <- predict(model.nb, valset)
+
+cM.nb <- confusionMatrix(prediction.nb, classe.val)
+
+```
+
+```{r support_vector_machine, warning=FALSE, cache=FALSE}
+
+file.svm <- paste0(my.workdir, "\\model.svm.Rds")
+
+if (file.exists(file.svm)) {
+        model.svm <- readRDS(file.svm)
+} else {
+        ctrl <- trainControl(method = 'cv', 
+                             number = 10)
+        model.svm <- train(classe.modelset ~ ., 
+                           data = modelset, 
+                           method = "svmRadial", 
+                           trControl = ctrl) 
+        saveRDS(model.svm, file.svm)
+}
+
+prediction.svm <- predict(model.svm, valset)
+
+cM.svm <- confusionMatrix(prediction.svm, classe.val)
+
+```
+
+```{r qda, warning=FALSE, cache=FALSE}
+
+file.qda <- paste0(my.workdir, "\\model.qda.Rds")
+
+if (file.exists(file.qda)) {
+        model.qda <- readRDS(file.qda)
+} else {
+        ctrl <- trainControl(method = 'cv', 
+                             number = 10)
+        model.qda <- train(classe.modelset ~ ., 
+                           data = modelset, 
+                           method = "qda", 
+                           trControl = ctrl)   
+        saveRDS(model.qda, file.qda)
+}
+
+prediction.qda <- predict(model.qda, valset)
+
+cM.qda <- confusionMatrix(prediction.qda, classe.val)
+
+```
+
+
+# Cross-validation and out-of-sample error
+
+The confusion matrices collected above are put into a list. 
+
+```{r compare_confusion_matrices}
+
+cM.list <- list(RF = cM.rf$table, 
+                NB = cM.nb$table, 
+                SVM = cM.svm$table, 
+                QDA = cM.qda$table)
+cM.list
+
+```
+It turns out all four models perform rather well, but there are differences. 
+
+In order to make statistical statements about model performance 10 resamples are created of each model and summarized below. 
+
+```{r model_accuracy}
+
+resamps <- resamples(list(RF = model.rf,
+                          NB = model.nb, 
+                          SVM = model.svm, 
+                          QDA = model.qda))
+summary(resamps)
+
+# Create a dotplot for hypothesis testing
+trellis.par.set(caretTheme())
+dotplot(resamps, metric = "Accuracy")
+
+```
+
+The best three models are SVM, RF and QDA, while NB is performing markedly more poorly at the chosen settings for this dataset.  
+
+# Learning efficiency 
+
+Since the model accuracies are rather close for the three best models one could ask the question, which model provides the "biggest bang for the buck" as far as runtime complexity is concerned. The computation times and memory usage are extracted and compared for each model. A *bang.for.buck* parameter is defined as the ratio of model accuracy over computation time. 
+
+```{r model_comparison}
+
+# Compare runtime complexity in relation to accuracy
+accuracies <- rbind(RF = cM.rf$overall[1], 
+                    NB = cM.nb$overall[1], 
+                    SVM = cM.svm$overall[1],
+                    QDA = cM.qda$overall[1])
+timings <- resamps$timings[1]
+
+bang.for.buck <- accuracies/timings
+bang.for.buck <- cbind(bang.for.buck, rownames(bang.for.buck))
+names(bang.for.buck) <- c("bang", "method")
+bang.for.buck <- arrange(bang.for.buck, desc(bang))
+qplot(x = method, y = bang, data=bang.for.buck,
+      geom = "bar",
+      stat="identity", 
+      fill = method, 
+      xlab = "ML Method", 
+      ylab = "Accuracy / Computation Time")
+
+# Compare memory usage of each model
+
+memuse <- as.data.frame(rbind(
+                RF = as.numeric(object.size(model.rf)),
+                NB = as.numeric(object.size(model.nb)), 
+               SVM = as.numeric(object.size(model.svm)), 
+               QDA = as.numeric(object.size(model.qda))
+               ))
+names(memuse) <- c("Memory [Bytes]")
+memuse
+
+
+```
+
+# Selecting the final model
+
+Looking at the accuracy/computation time figure RF wins hands down. We also have a clear looser, naive Bayesian learner, which achieved the lowest accuracy, but used up the most memory. 
+For the final model the random forest approach is picked, since it computes fast (at the parameters chosen) and achieves a very large accuracy. A bit of fine tuning is done with regard to chaning the resampling technique to *oob* and increasing the number of trees to 100. 
+
+
+```{r rf_final_run, warning=FALSE, cache=TRUE}
+
+file.final <- paste0(my.workdir, "\\model.final.Rds")
+
+if (file.exists(file.final)) {
+        model.final <- readRDS(file.final)
+} else {
+        mtryGrid <- expand.grid(mtry = 20)
+        ctrl <- trainControl(method = 'oob')
+        model.final <- train(classe.train ~ ., 
+                          data = training, 
+                          method = "rf", 
+                          importance = TRUE, 
+                          ntree = 100, 
+                          tuneGrid = mtryGrid, 
+                          trControl = ctrl )     
+        saveRDS(model.final, file.final)       
+}
+
+prediction.final <- predict(model.final, valset)
+
+cM.final <- confusionMatrix(prediction.final, classe.val)
+
+cM.final
+
+```
+
+# Conclusion
+
+The random forest model was finally run using oob resampling and number of trees 100. Exploring more trees will improve accuracy slightly, but at high computation cost (data not shown). The total training with above settings took `r model.final$times$everything[[1]]` seconds to achieve an accuracy of `r round(cM.final$overall[1]*100, 1)` +/- (`r round(as.numeric(cM.final$overall[3:4])*100, 1)`)%. 
